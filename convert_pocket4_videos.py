@@ -6,12 +6,13 @@ import re
 import subprocess
 import shutil
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 
 POCKET4_VOLUME_PATTERN = re.compile(r"pocket\s*4", re.IGNORECASE)
 DEFAULT_VOLUME_ROOT = Path("/Volumes")
 CAPTION_BASE_DATE = date(2026, 3, 19)
+PROGRESS_BAR_WIDTH = 20
 
 
 def find_pocket4_mounts(volume_root: Path = DEFAULT_VOLUME_ROOT) -> List[Path]:
@@ -180,12 +181,102 @@ def prompt_for_mp4_files(files: List[Path]) -> List[Path]:
         return [files[index] for index in indexes]
 
 
+def build_progress_bar(percent: int) -> str:
+    """Build a fixed-width text progress bar."""
+    percent = max(0, min(100, percent))
+    filled = int(PROGRESS_BAR_WIDTH * percent / 100)
+    filled = max(0, min(PROGRESS_BAR_WIDTH, filled))
+    return f"[{'█' * filled}{'░' * (PROGRESS_BAR_WIDTH - filled)}]"
+
+
+def parse_ffmpeg_timecode(timecode: str) -> float:
+    """Convert an ffmpeg HH:MM:SS.microseconds timecode into seconds."""
+    try:
+        hours, minutes, seconds = timecode.strip().split(":")
+        return (int(hours) * 3600) + (int(minutes) * 60) + float(seconds)
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+class ProgressReporter:
+    """Render per-file progress bars or plain fallback logs."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.current_label = ""
+
+    def log(self, message: str) -> None:
+        """Write a message to stdout safely, clearing the progress line first if enabled."""
+        if self.enabled:
+            sys.stdout.write("\r\033[K" + message + "\n")
+            sys.stdout.flush()
+        else:
+            print(message)
+
+    def start_file(self, index: int, total: int, file_name: str) -> None:
+        """Begin reporting for a file."""
+        self.current_label = f"[{index}/{total}] {file_name}"
+        if self.enabled:
+            self.render(0, "인코딩")
+        else:
+            print(f"{self.current_label} - 인코딩 시작")
+
+    def render(self, percent: int, phase: str) -> None:
+        """Render a progress update for the current file."""
+        percent = max(0, min(100, percent))
+        if self.enabled:
+            bar = build_progress_bar(percent)
+            line = f"{self.current_label} {bar} {percent:3d}% {phase}"
+            sys.stdout.write("\r\033[K" + line)
+            if percent >= 100:
+                sys.stdout.write("\n")
+            sys.stdout.flush()
+        else:
+            print(f"{self.current_label} - {phase}")
+
+    def update_encoding(self, raw_percent: int) -> None:
+        """Update the encoding phase using the raw ffmpeg percent."""
+        if self.enabled:
+            overall_percent = min(90, max(0, int(raw_percent * 0.9)))
+            self.render(overall_percent, "인코딩")
+
+    def finish_encoding(self) -> None:
+        """Mark encoding as complete."""
+        self.render(90, "인코딩 완료")
+
+    def mark_caption(self, caption: str) -> None:
+        """Mark the caption step."""
+        self.render(95, f"캡션: {caption}")
+
+    def mark_photos(self, success: bool) -> None:
+        """Mark the Photos import step."""
+        self.render(98, "Photos 추가" if success else "Photos 실패")
+
+    def complete(self) -> None:
+        """Mark the file as fully processed."""
+        self.render(100, "완료")
+
+    def skip_existing(self) -> None:
+        """Report that the output file already exists."""
+        if self.enabled:
+            self.render(100, "이미 변환됨")
+        else:
+            print(f"{self.current_label} - 이미 변환됨, 건너뜀")
+
+
 def build_ffmpeg_command(source: Path, target: Path, ffmpeg_path: str) -> List[str]:
     """Build the ffmpeg command for a fast HEVC 1080p transcode."""
     scale_filter = "scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2"
 
     return [
         ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-nostats",
+        "-progress",
+        "pipe:2",
         "-y",
         "-i",
         str(source),
@@ -207,41 +298,117 @@ def build_ffmpeg_command(source: Path, target: Path, ffmpeg_path: str) -> List[s
     ]
 
 
+def run_ffmpeg_with_progress(
+    command: List[str],
+    duration_seconds: Optional[float],
+    on_progress: Optional[Callable[[int], None]] = None,
+) -> None:
+    """Run ffmpeg and stream progress information from stderr."""
+    if duration_seconds is None or duration_seconds <= 0:
+        completed = subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if on_progress is not None:
+            on_progress(100)
+        if completed.stderr:
+            last_line = completed.stderr.strip().splitlines()[-1]
+            if last_line and "=" not in last_line:
+                raise subprocess.CalledProcessError(completed.returncode, command, output=completed.stdout, stderr=completed.stderr)
+        return
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    if process.stderr is None:
+        raise RuntimeError("Unable to read ffmpeg progress output.")
+
+    log_lines = []
+    last_reported_percent = -1
+
+    try:
+        while True:
+            line = process.stderr.readline()
+            if line == "" and process.poll() is not None:
+                break
+            if not line:
+                continue
+
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            if "=" in stripped:
+                key, value = stripped.split("=", 1)
+                if key == "out_time":
+                    elapsed_seconds = parse_ffmpeg_timecode(value)
+                    raw_percent = int((elapsed_seconds / duration_seconds) * 100)
+                    raw_percent = max(0, min(100, raw_percent))
+                    if on_progress is not None and raw_percent != last_reported_percent:
+                        last_reported_percent = raw_percent
+                        on_progress(raw_percent)
+                    continue
+                if key == "progress" and value == "end":
+                    if on_progress is not None:
+                        on_progress(100)
+                    continue
+
+            log_lines.append(stripped)
+    finally:
+        process.wait()
+
+    if process.returncode != 0:
+        stderr_text = "\n".join(log_lines[-10:])
+        raise subprocess.CalledProcessError(process.returncode, command, output=None, stderr=stderr_text)
+
+
 def convert_mp4_to_mov(
     source: Path,
     ffmpeg_path: str,
     dry_run: bool = False,
     output_dir: Optional[Path] = None,
+    on_progress: Optional[Callable[[int], None]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """Convert one mp4 into a mov file in the chosen output directory."""
     target_dir = output_dir or Path.cwd()
     target = target_dir / source.with_suffix(".mov").name
 
+    def log(msg: str) -> None:
+        if log_callback:
+            log_callback(msg)
+        else:
+            print(msg)
+
     if target.exists():
-        print(f"Skip: already converted -> {target.name}")
+        log(f"Skip: already converted -> {target.name}")
         return False
 
     command = build_ffmpeg_command(source, target, ffmpeg_path)
-    print(f"Convert: {source.name} -> {target.name}")
+    log(f"Convert: {source.name} -> {target.name}")
 
     if dry_run:
-        print("  " + " ".join(command))
+        log("  " + " ".join(command))
         return True
 
+    duration_seconds = probe_video_duration(source)
+
     try:
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        run_ffmpeg_with_progress(command, duration_seconds, on_progress=on_progress)
     except subprocess.CalledProcessError as exc:
-        print(f"Failed: {source.name}")
+        log(f"Failed: {source.name}")
         if exc.stderr:
-            print(exc.stderr.strip().splitlines()[-1])
+            log(exc.stderr.strip().splitlines()[-1])
         return False
 
     try:
         source_stat = source.stat()
         os.utime(target, (source_stat.st_atime, source_stat.st_mtime))
     except OSError as exc:
-        print(f"Warning: could not copy timestamps for {target.name}.")
-        print(str(exc))
+        log(f"Warning: could not copy timestamps for {target.name}.")
+        log(str(exc))
 
     return True
 
@@ -271,23 +438,30 @@ def import_into_photos(
     file_paths: List[Path],
     captions: Optional[List[str]] = None,
     dry_run: bool = False,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """Import files into Photos and write each caption into the description field."""
+    def log(msg: str) -> None:
+        if log_callback:
+            log_callback(msg)
+        else:
+            print(msg)
+
     if not file_paths:
         return True
 
     if dry_run:
-        print("Import to Photos:")
+        log("Import to Photos:")
         for index, path in enumerate(file_paths):
             caption = captions[index] if captions and index < len(captions) else ""
             if caption:
-                print(f"  {path} -> caption: {caption}")
+                log(f"  {path} -> caption: {caption}")
             else:
-                print(f"  {path}")
+                log(f"  {path}")
         return True
 
     if shutil.which("osascript") is None:
-        print("Warning: osascript is not available, skipping Photos import.")
+        log("Warning: osascript is not available, skipping Photos import.")
         return False
 
     apple_script_paths = ", ".join(quote_applescript_posix_path(path) for path in file_paths)
@@ -308,12 +482,12 @@ def import_into_photos(
     try:
         subprocess.run(["osascript", "-e", script], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except subprocess.CalledProcessError as exc:
-        print("Warning: Photos import failed.")
+        log("Warning: Photos import failed.")
         if exc.stderr:
-            print(exc.stderr.strip().splitlines()[-1])
+            log(exc.stderr.strip().splitlines()[-1])
         return False
 
-    print(f"Imported {len(file_paths)} file(s) into Photos.")
+    log(f"Imported {len(file_paths)} file(s) into Photos.")
     return True
 
 
@@ -331,19 +505,44 @@ def process_files(
     if not mp4_files:
         return 0, 0, 0
 
+    reporter = ProgressReporter(enabled=sys.stdout.isatty() and not dry_run)
     print(f"\nProcessing {len(mp4_files)} selected mp4 file(s)")
 
-    for source in mp4_files:
-        changed = convert_mp4_to_mov(source, ffmpeg_path, dry_run=dry_run, output_dir=output_dir)
+    total_files = len(mp4_files)
+    for index, source in enumerate(mp4_files, start=1):
+        target_dir = output_dir or Path.cwd()
+        target = target_dir / source.with_suffix(".mov").name
+        reporter.start_file(index, total_files, source.name)
+
+        if target.exists():
+            reporter.skip_existing()
+            skipped += 1
+            continue
+
+        changed = convert_mp4_to_mov(
+            source,
+            ffmpeg_path,
+            dry_run=dry_run,
+            output_dir=output_dir,
+            on_progress=reporter.update_encoding,
+            log_callback=reporter.log,
+        )
         if changed:
             converted += 1
-            mov_path = (output_dir or Path.cwd()) / source.with_suffix(".mov").name
+            reporter.finish_encoding()
+            mov_path = target
             caption = make_caption(source)
+            reporter.mark_caption(caption)
             if import_photos:
-                if import_into_photos([mov_path], captions=[caption], dry_run=dry_run):
+                if import_into_photos([mov_path], captions=[caption], dry_run=dry_run, log_callback=reporter.log):
+                    reporter.mark_photos(True)
                     imported += 1
+                else:
+                    reporter.mark_photos(False)
         else:
             skipped += 1
+
+        reporter.complete()
 
     return converted, skipped, imported
 
