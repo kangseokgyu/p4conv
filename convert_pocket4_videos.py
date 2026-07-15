@@ -109,12 +109,13 @@ def probe_video_duration(path: Path) -> Optional[float]:
 
 def describe_mp4_file(path: Path) -> str:
     """Build the display string shown in the selection list."""
+    mtime_str = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
     size_label = format_file_size(path.stat().st_size)
     duration_seconds = probe_video_duration(path)
     if duration_seconds is None:
-        return f"{path.name} | {size_label}"
+        return f"{path.name} | {mtime_str} | {size_label}"
     duration_label = format_duration(duration_seconds)
-    return f"{path.name} | {duration_label} | {size_label}"
+    return f"{path.name} | {mtime_str} | {duration_label} | {size_label}"
 
 
 def display_mp4_files(files: List[Path]) -> None:
