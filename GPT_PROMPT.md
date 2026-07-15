@@ -56,6 +56,21 @@
 - `pocket4_converter/convert_pocket4_videos.py`
 - `pocket4_converter/README.md`
 
+## 저장소 기준 실행 방식
+
+- 프로젝트는 GitHub 저장소로 관리한다
+- 사용자는 저장소를 `git clone`으로 받은 뒤 `cd p4conv`에서 작업한다
+- 코드 예시는 저장소 루트 기준 상대경로로 작성한다
+- 절대경로는 사용하지 않는다
+
+## 실행 예시
+
+```bash
+git clone https://github.com/kangseokgyu/p4conv.git
+cd p4conv
+python3 ./convert_pocket4_videos.py
+```
+
 ## 코드 스타일
 
 - 모든 함수에 Python docstring을 작성한다

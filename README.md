@@ -5,7 +5,9 @@
 ## 사용법
 
 ```bash
-/Users/kangseokgyu/workspace/yuha-repo/.venv/bin/python3 /Users/kangseokgyu/workspace/yuha-repo/pocket4_converter/convert_pocket4_videos.py
+git clone https://github.com/kangseokgyu/p4conv.git
+cd p4conv
+python3 ./convert_pocket4_videos.py
 ```
 
 실행하면 저장된 `mp4` 목록이 파일명, 길이, 파일 크기와 함께 표시됩니다.
@@ -27,3 +29,13 @@
 - `--source-root`: 추가 소스 루트 지정
 - `--dry-run`: 실제 변환 대신 명령만 출력
 - `--no-import-photos`: Photos import 생략
+
+## 가상환경 사용
+
+프로젝트에 맞는 Python을 쓰고 싶다면 checkout 받은 뒤 원하는 가상환경에서 실행하세요.
+
+```bash
+cd p4conv
+source .venv/bin/activate
+python ./convert_pocket4_videos.py
+```
