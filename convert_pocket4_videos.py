@@ -538,6 +538,14 @@ def process_files(
                 if import_into_photos([mov_path], captions=[caption], dry_run=dry_run, log_callback=reporter.log):
                     reporter.mark_photos(True)
                     imported += 1
+                    if not dry_run:
+                        try:
+                            mov_path.unlink()
+                            reporter.log(f"Deleted temporary converted file: {mov_path.name}")
+                        except OSError as exc:
+                            reporter.log(f"Warning: could not delete temporary file {mov_path.name}: {exc}")
+                    else:
+                        reporter.log(f"Dry-run: Would delete temporary file: {mov_path.name}")
                 else:
                     reporter.mark_photos(False)
         else:
