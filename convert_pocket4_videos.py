@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import threading
 from datetime import date, datetime
 import re
 import subprocess
@@ -8,11 +9,26 @@ import shutil
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+try:
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+
+    _YOUTUBE_AVAILABLE = True
+except ImportError:
+    _YOUTUBE_AVAILABLE = False
+
 
 POCKET4_VOLUME_PATTERN = re.compile(r"pocket\s*4", re.IGNORECASE)
 DEFAULT_VOLUME_ROOT = Path("/Volumes")
 CAPTION_BASE_DATE = date(2026, 3, 19)
 PROGRESS_BAR_WIDTH = 20
+
+YOUTUBE_UPLOAD_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+CLIENT_SECRETS_FILE = "client_secrets.json"
+TOKEN_FILE = "token.json"
 
 
 def find_pocket4_mounts(volume_root: Path = DEFAULT_VOLUME_ROOT) -> List[Path]:
@@ -200,69 +216,279 @@ def parse_ffmpeg_timecode(timecode: str) -> float:
 
 
 class ProgressReporter:
-    """Render per-file progress bars or plain fallback logs."""
+    """Render per-file progress bars with thread-safe dual progress display."""
 
     def __init__(self, enabled: bool) -> None:
         self.enabled = enabled
         self.current_label = ""
+        self.upload_enabled = False
+        self.upload_percent = 0
+        self.encode_percent = 0
+        self._lock = threading.Lock()
 
     def log(self, message: str) -> None:
         """Write a message to stdout safely, clearing the progress line first if enabled."""
-        if self.enabled:
-            sys.stdout.write("\r\033[K" + message + "\n")
-            sys.stdout.flush()
-        else:
-            print(message)
+        with self._lock:
+            if self.enabled:
+                sys.stdout.write("\r\033[K" + message + "\n")
+                self._redraw_unlocked()
+            else:
+                print(message)
 
     def start_file(self, index: int, total: int, file_name: str) -> None:
         """Begin reporting for a file."""
-        self.current_label = f"[{index}/{total}] {file_name}"
-        if self.enabled:
-            self.render(0, "인코딩")
-        else:
-            print(f"{self.current_label} - 인코딩 시작")
+        with self._lock:
+            self.current_label = f"[{index}/{total}] {file_name}"
+            self.upload_percent = 0
+            self.encode_percent = 0
+            if self.enabled:
+                self._render_unlocked("시작")
+            else:
+                print(f"{self.current_label} - 시작")
 
-    def render(self, percent: int, phase: str) -> None:
-        """Render a progress update for the current file."""
-        percent = max(0, min(100, percent))
+    def render(self, phase: str) -> None:
+        """Render a progress update for the current file (thread-safe)."""
+        with self._lock:
+            self._render_unlocked(phase)
+
+    def _render_unlocked(self, phase: str) -> None:
+        """Render progress without acquiring the lock (caller must hold _lock)."""
         if self.enabled:
-            bar = build_progress_bar(percent)
-            line = f"{self.current_label} {bar} {percent:3d}% {phase}"
+            if self.upload_enabled:
+                upload_bar = build_progress_bar(self.upload_percent)
+                encode_bar = build_progress_bar(self.encode_percent)
+                line = (
+                    f"{self.current_label}"
+                    f" | 업로드 {upload_bar} {self.upload_percent:3d}%"
+                    f" | 인코딩 {encode_bar} {self.encode_percent:3d}%"
+                    f" | {phase}"
+                )
+            else:
+                encode_bar = build_progress_bar(self.encode_percent)
+                line = (
+                    f"{self.current_label}"
+                    f" | 인코딩 {encode_bar} {self.encode_percent:3d}%"
+                    f" | {phase}"
+                )
             sys.stdout.write("\r\033[K" + line)
-            if percent >= 100:
-                sys.stdout.write("\n")
             sys.stdout.flush()
         else:
             print(f"{self.current_label} - {phase}")
 
+    def _redraw_unlocked(self) -> None:
+        """Redraw the progress bar after a log line (caller must hold _lock)."""
+        if not self.enabled:
+            return
+        if self.upload_enabled:
+            upload_bar = build_progress_bar(self.upload_percent)
+            encode_bar = build_progress_bar(self.encode_percent)
+            line = (
+                f"{self.current_label}"
+                f" | 업로드 {upload_bar} {self.upload_percent:3d}%"
+                f" | 인코딩 {encode_bar} {self.encode_percent:3d}%"
+                f" |"
+            )
+        else:
+            encode_bar = build_progress_bar(self.encode_percent)
+            line = (
+                f"{self.current_label}"
+                f" | 인코딩 {encode_bar} {self.encode_percent:3d}%"
+                f" |"
+            )
+        sys.stdout.write("\r\033[K" + line)
+        sys.stdout.flush()
+
+    def update_upload(self, raw_percent: int) -> None:
+        """Update the upload progress (thread-safe, called from upload thread)."""
+        with self._lock:
+            self.upload_percent = max(0, min(100, raw_percent))
+            self._render_unlocked("업로드")
+
     def update_encoding(self, raw_percent: int) -> None:
         """Update the encoding phase using the raw ffmpeg percent."""
-        if self.enabled:
-            overall_percent = min(90, max(0, int(raw_percent * 0.9)))
-            self.render(overall_percent, "인코딩")
+        with self._lock:
+            self.encode_percent = max(0, min(100, raw_percent))
+            self._render_unlocked("인코딩")
 
     def finish_encoding(self) -> None:
         """Mark encoding as complete."""
-        self.render(90, "인코딩 완료")
+        with self._lock:
+            self.encode_percent = 100
+            self._render_unlocked("인코딩 완료")
+
+    def finish_upload(self, success: bool) -> None:
+        """Mark upload as complete."""
+        with self._lock:
+            self.upload_percent = 100
+            phase = "업로드 완료" if success else "업로드 실패"
+            self._render_unlocked(phase)
 
     def mark_caption(self, caption: str) -> None:
         """Mark the caption step."""
-        self.render(95, f"캡션: {caption}")
+        self.render(f"캡션: {caption}")
 
     def mark_photos(self, success: bool) -> None:
         """Mark the Photos import step."""
-        self.render(98, "Photos 추가" if success else "Photos 실패")
+        self.render("Photos 추가" if success else "Photos 실패")
 
     def complete(self) -> None:
         """Mark the file as fully processed."""
-        self.render(100, "완료")
+        with self._lock:
+            if self.enabled:
+                if self.upload_enabled:
+                    upload_bar = build_progress_bar(100)
+                    encode_bar = build_progress_bar(100)
+                    line = (
+                        f"{self.current_label}"
+                        f" | 업로드 {upload_bar} 100%"
+                        f" | 인코딩 {encode_bar} 100%"
+                        f" | 완료"
+                    )
+                else:
+                    encode_bar = build_progress_bar(100)
+                    line = (
+                        f"{self.current_label}"
+                        f" | 인코딩 {encode_bar} 100%"
+                        f" | 완료"
+                    )
+                sys.stdout.write("\r\033[K" + line + "\n")
+                sys.stdout.flush()
+            else:
+                print(f"{self.current_label} - 완료")
 
     def skip_existing(self) -> None:
         """Report that the output file already exists."""
         if self.enabled:
-            self.render(100, "이미 변환됨")
+            self.render("이미 변환됨")
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         else:
             print(f"{self.current_label} - 이미 변환됨, 건너뜀")
+
+
+class YouTubeUploader:
+    """Manage YouTube API authentication and video uploads."""
+
+    def __init__(
+        self,
+        client_secrets_path: Path,
+        token_path: Path,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.client_secrets_path = client_secrets_path
+        self.token_path = token_path
+        self._log_callback = log_callback
+        self.service = None
+
+    def log(self, message: str) -> None:
+        """Write a log message using the callback or stdout."""
+        if self._log_callback:
+            self._log_callback(message)
+        else:
+            print(message)
+
+    def authenticate(self) -> bool:
+        """Authenticate with YouTube using OAuth 2.0 and build the API service."""
+        if not _YOUTUBE_AVAILABLE:
+            self.log("Warning: google-api-python-client 또는 google-auth-oauthlib이 설치되지 않았습니다.")
+            self.log("  pip install google-api-python-client google-auth-oauthlib")
+            return False
+
+        if not self.client_secrets_path.exists():
+            self.log(f"Warning: {self.client_secrets_path} 파일이 없습니다. YouTube 업로드를 건너뜁니다.")
+            return False
+
+        creds = None
+        if self.token_path.exists():
+            try:
+                creds = Credentials.from_authorized_user_file(str(self.token_path), YOUTUBE_UPLOAD_SCOPES)
+            except Exception:
+                creds = None
+
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception:
+                creds = None
+
+        if not creds or not creds.valid:
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    str(self.client_secrets_path), YOUTUBE_UPLOAD_SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+            except Exception as exc:
+                self.log(f"Warning: YouTube OAuth 인증 실패: {exc}")
+                return False
+
+        try:
+            with open(self.token_path, "w") as token_file:
+                token_file.write(creds.to_json())
+        except OSError as exc:
+            self.log(f"Warning: 토큰 저장 실패: {exc}")
+
+        try:
+            self.service = build("youtube", "v3", credentials=creds)
+        except Exception as exc:
+            self.log(f"Warning: YouTube API 서비스 초기화 실패: {exc}")
+            return False
+
+        self.log("YouTube 인증 완료.")
+        return True
+
+    def upload_video(
+        self,
+        video_path: Path,
+        title: str,
+        description: str,
+        on_progress: Optional[Callable[[int], None]] = None,
+    ) -> bool:
+        """Upload a video to YouTube as a private video with resumable upload."""
+        if self.service is None:
+            self.log("Warning: YouTube 서비스가 초기화되지 않았습니다.")
+            return False
+
+        body = {
+            "snippet": {
+                "title": title,
+                "description": description,
+                "categoryId": "22",
+            },
+            "status": {
+                "privacyStatus": "private",
+            },
+        }
+
+        media = MediaFileUpload(
+            str(video_path),
+            chunksize=10 * 1024 * 1024,
+            resumable=True,
+        )
+
+        try:
+            request = self.service.videos().insert(
+                part="snippet,status",
+                body=body,
+                media_body=media,
+            )
+
+            response = None
+            while response is None:
+                status, response = request.next_chunk()
+                if status and on_progress:
+                    percent = int(status.progress() * 100)
+                    on_progress(percent)
+
+            if on_progress:
+                on_progress(100)
+
+            video_id = response.get("id", "unknown")
+            self.log(f"YouTube 업로드 완료: https://youtu.be/{video_id}")
+            return True
+
+        except Exception as exc:
+            self.log(f"Warning: YouTube 업로드 실패: {exc}")
+            return False
 
 
 def build_ffmpeg_command(source: Path, target: Path, ffmpeg_path: str) -> List[str]:
@@ -435,6 +661,13 @@ def make_caption(source: Path) -> str:
     return f"{delta_days}"
 
 
+def make_youtube_description(source: Path, caption: str) -> str:
+    """Create the YouTube video description from the source file metadata."""
+    source_mtime = datetime.fromtimestamp(source.stat().st_mtime)
+    date_str = source_mtime.strftime("%Y-%m-%d %H:%M:%S")
+    return f"촬영일: {date_str}\nD+{caption}"
+
+
 def import_into_photos(
     file_paths: List[Path],
     captions: Optional[List[str]] = None,
@@ -497,6 +730,7 @@ def process_files(
     ffmpeg_path: str,
     dry_run: bool = False,
     import_photos: bool = True,
+    import_youtube: bool = True,
     output_dir: Optional[Path] = None,
 ) -> Tuple[int, int, int]:
     """Convert and import a selected batch of files one by one."""
@@ -509,10 +743,25 @@ def process_files(
     reporter = ProgressReporter(enabled=sys.stdout.isatty() and not dry_run)
     print(f"\nProcessing {len(mp4_files)} selected mp4 file(s)")
 
+    # YouTube service initialization
+    uploader = None
+    if import_youtube:
+        script_dir = Path(__file__).resolve().parent
+        uploader = YouTubeUploader(
+            client_secrets_path=script_dir / CLIENT_SECRETS_FILE,
+            token_path=script_dir / TOKEN_FILE,
+            log_callback=reporter.log,
+        )
+        if not uploader.authenticate():
+            uploader = None
+
     total_files = len(mp4_files)
     for index, source in enumerate(mp4_files, start=1):
         target_dir = output_dir or Path.cwd()
         target = target_dir / source.with_suffix(".mov").name
+
+        file_upload_enabled = uploader is not None
+        reporter.upload_enabled = file_upload_enabled
         reporter.start_file(index, total_files, source.name)
 
         if target.exists():
@@ -520,6 +769,33 @@ def process_files(
             skipped += 1
             continue
 
+        caption = make_caption(source)
+
+        # Parallel: upload original MP4 to YouTube + encode to MOV
+        upload_result = {"success": False}
+
+        def _upload_task() -> None:
+            """Background thread: upload original MP4 to YouTube."""
+            yt_title = source.name
+            yt_description = make_youtube_description(source, caption)
+            if dry_run:
+                reporter.log(f"YouTube 업로드 (dry-run): {source.name}")
+                reporter.log(f"  제목: {yt_title}")
+                reporter.log(f"  설명: {yt_description}")
+                upload_result["success"] = True
+                reporter.finish_upload(True)
+                return
+            upload_result["success"] = uploader.upload_video(
+                source, yt_title, yt_description, on_progress=reporter.update_upload,
+            )
+            reporter.finish_upload(upload_result["success"])
+
+        upload_thread = None
+        if file_upload_enabled:
+            upload_thread = threading.Thread(target=_upload_task, daemon=True)
+            upload_thread.start()
+
+        # Main thread: encode MP4 -> MOV
         changed = convert_mp4_to_mov(
             source,
             ffmpeg_path,
@@ -528,11 +804,15 @@ def process_files(
             on_progress=reporter.update_encoding,
             log_callback=reporter.log,
         )
+
+        # Wait for upload thread to finish
+        if upload_thread is not None:
+            upload_thread.join()
+
         if changed:
             converted += 1
             reporter.finish_encoding()
             mov_path = target
-            caption = make_caption(source)
             reporter.mark_caption(caption)
             if import_photos:
                 if import_into_photos([mov_path], captions=[caption], dry_run=dry_run, log_callback=reporter.log):
@@ -582,6 +862,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip importing newly converted MOV files into Photos.",
     )
+    parser.add_argument(
+        "--no-upload-youtube",
+        action="store_true",
+        help="Skip uploading original MP4 files to YouTube.",
+    )
     return parser.parse_args()
 
 
@@ -623,6 +908,7 @@ def main() -> int:
         ffmpeg_path,
         dry_run=args.dry_run,
         import_photos=not args.no_import_photos,
+        import_youtube=not args.no_upload_youtube,
         output_dir=output_dir,
     )
     total_converted += converted
