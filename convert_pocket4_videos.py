@@ -732,6 +732,7 @@ def process_files(
     import_photos: bool = True,
     import_youtube: bool = True,
     output_dir: Optional[Path] = None,
+    reporter: Optional["ProgressReporter"] = None,
 ) -> Tuple[int, int, int]:
     """Convert and import a selected batch of files one by one."""
     converted = 0
@@ -740,8 +741,8 @@ def process_files(
     if not mp4_files:
         return 0, 0, 0
 
-    reporter = ProgressReporter(enabled=sys.stdout.isatty() and not dry_run)
-    print(f"\nProcessing {len(mp4_files)} selected mp4 file(s)")
+    reporter = reporter or ProgressReporter(enabled=sys.stdout.isatty() and not dry_run)
+    reporter.log(f"Processing {len(mp4_files)} selected mp4 file(s)")
 
     # YouTube service initialization
     uploader = None
@@ -867,12 +868,34 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip uploading original MP4 files to YouTube.",
     )
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Use the legacy terminal interface instead of the web interface.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Local port for the web interface (default: 8765).",
+    )
+    parser.add_argument(
+        "--no-open-browser",
+        action="store_true",
+        help="Do not automatically open the web interface in a browser.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     """Main entry point: locate files, prompt for selection, then process them."""
     args = parse_args()
+
+    if not args.cli:
+        from web_app import run_web_app
+
+        return run_web_app(args)
+
     ffmpeg_path = shutil.which("ffmpeg")
 
     if not ffmpeg_path:
