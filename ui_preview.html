@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pocket 4 Converter UI Preview</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #f8fafc; background: #0f172a; font-size: 14px; }
+    body { max-width: 1280px; margin: 0 auto; padding: 28px 24px; }
+    h1 { margin: 0; font-size: 26px; letter-spacing: -.5px; color: #f8fafc; font-weight: 700; }
+    p { margin: 6px 0 0; color: #94a3b8; }
+    .toolbar { display: flex; gap: 8px; align-items: center; margin: 20px 0 12px; }
+    button { border: 1px solid #334155; border-radius: 7px; padding: 8px 12px; font: 600 13px inherit; cursor: pointer; background: #1e293b; color: #f8fafc; transition: background .15s, border-color .15s; }
+    button:hover:not(:disabled) { background: #334155; border-color: #475569; }
+    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    button.primary:hover:not(:disabled) { background: #1d4ed8; border-color: #1d4ed8; }
+    .spacer { flex: 1; }
+    .status { color: #cbd5e1; font-size: 13px; font-weight: 600; }
+    .card { overflow: auto; border: 1px solid #334155; border-radius: 10px; background: #1e293b; box-shadow: 0 4px 6px -1px #0000004d, 0 2px 4px -2px #0000004d; }
+    table { width: 100%; min-width: 940px; border-collapse: collapse; }
+    th, td { padding: 12px 14px; border-bottom: 1px solid #334155; text-align: left; vertical-align: middle; }
+    th { color: #94a3b8; background: #0f172a; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; font-weight: 700; }
+    th:last-child { width: 320px; }
+    tr:last-child td { border-bottom: 0; }
+    tr:hover td { background: #273549; }
+    input[type="checkbox"] { width: 16px; height: 16px; accent-color: #3b82f6; cursor: pointer; }
+    .file-name { color: #f8fafc; font-weight: 600; }
+    .file-path { margin-top: 2px; color: #94a3b8; font-size: 12px; }
+    .badge { display: inline-flex; align-items: center; border-radius: 99px; padding: 4px 10px; color: #cbd5e1; background: #334155; font-size: 12px; font-weight: 600; white-space: nowrap; }
+    .badge.done { color: #34d399; background: #064e3b; }
+    .progress-line { display: flex; align-items: center; gap: 8px; min-width: 295px; white-space: nowrap; }
+    .status-mark { display: inline-flex; align-items: center; gap: 5px; color: #94a3b8; font-size: 12px; font-weight: 700; }
+    .status-mark i { display: grid; width: 20px; height: 20px; place-items: center; border-radius: 50%; color: #cbd5e1; background: #334155; font-size: 11px; font-style: normal; }
+    .status-mark.active { color: #60a5fa; }
+    .status-mark.active i { color: #60a5fa; background: #1e3a8a; }
+    .status-mark.done { color: #34d399; }
+    .status-mark.done i { color: #34d399; background: #064e3b; }
+    .status-mark.fail { color: #f87171; }
+    .status-mark.fail i { color: #f87171; background: #7f1d1d; }
+    .mini-steps { display: flex; align-items: center; gap: 5px; }
+    .mini-step { display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border-radius: 6px; color: #94a3b8; background: #0f172a; font-size: 11px; font-weight: 600; border: 1px solid #334155; }
+    .mini-step b { color: #cbd5e1; font-weight: 700; }
+    .bar { width: 30px; height: 5px; overflow: hidden; border-radius: 99px; background: #334155; }
+    .bar i { display: block; height: 100%; border-radius: 99px; background: #64748b; }
+    .mini-step.active { color: #93c5fd; background: #1e3a8a; border-color: #2563eb; }
+    .mini-step.active b { color: #fff; }
+    .mini-step.active .bar i { background: #3b82f6; }
+    .mini-step.done { color: #6ee7b7; background: #064e3b; border-color: #059669; }
+    .mini-step.done b { color: #fff; }
+    .mini-step.done .bar i { background: #10b981; }
+    .mini-step.fail { color: #fca5a5; background: #7f1d1d; border-color: #dc2626; }
+    .mini-step.fail b { color: #fff; }
+    .mini-step.fail .bar i { background: #ef4444; }
+    .mini-step.skip { color: #64748b; border-color: transparent; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Pocket 4 Converter</h1>
+    <p>파일 선택과 변환 진행을 한 화면에서 관리합니다.</p>
+  </header>
+  <div class="toolbar">
+    <button>새로고침</button>
+    <button>전체 선택</button>
+    <button class="primary">선택한 파일 변환</button>
+    <span class="spacer"></span>
+    <span class="status">6개 파일 · 2개 처리 중</span>
+  </div>
+  <main class="card">
+    <table>
+      <thead><tr><th></th><th>파일</th><th>수정일</th><th>길이</th><th>크기</th><th>진행 상태</th></tr></thead>
+      <tbody>
+        <tr><td><input type="checkbox"></td><td><div class="file-name">DJI_20260730101001_0001_D.mp4</div></td><td>2026-07-30 10:10</td><td>1:42</td><td>835.2 MB</td><td><span class="badge">○ 대기 중</span></td></tr>
+        <tr><td><input type="checkbox" checked></td><td><div class="file-name">DJI_20260730101524_0002_D.mp4</div></td><td>2026-07-30 10:15</td><td>3:17</td><td>1.4 GB</td><td><div class="progress-line"><span class="status-mark active"><i>↻</i>처리 중</span><div class="mini-steps"><span class="mini-step active"><b>인코딩</b><span class="bar"><i style="width: 42%"></i></span><span>42%</span></span><span class="mini-step active"><b>YouTube</b><span class="bar"><i style="width: 18%"></i></span><span>18%</span></span><span class="mini-step"><b>Photos</b><span class="bar"><i style="width: 0%"></i></span><span>대기</span></span></div></div></td></tr>
+        <tr><td><input type="checkbox" checked></td><td><div class="file-name">DJI_20260730102203_0003_D.mp4</div></td><td>2026-07-30 10:22</td><td>2:08</td><td>1.1 GB</td><td><div class="progress-line"><span class="status-mark active"><i>↻</i>처리 중</span><div class="mini-steps"><span class="mini-step done"><b>인코딩</b><span class="bar"><i style="width: 100%"></i></span><span>100%</span></span><span class="mini-step done"><b>YouTube</b><span class="bar"><i style="width: 100%"></i></span><span>100%</span></span><span class="mini-step active"><b>Photos</b><span class="bar"><i style="width: 65%"></i></span><span>65%</span></span></div></div></td></tr>
+        <tr><td><input type="checkbox"></td><td><div class="file-name">DJI_20260730102819_0004_D.mp4</div></td><td>2026-07-30 10:28</td><td>0:58</td><td>468.7 MB</td><td><div class="progress-line"><span class="status-mark done"><i>✓</i>완료</span><div class="mini-steps"><span class="mini-step done"><b>인코딩</b><span class="bar"><i style="width: 100%"></i></span><span>100%</span></span><span class="mini-step done"><b>YouTube</b><span class="bar"><i style="width: 100%"></i></span><span>100%</span></span><span class="mini-step done"><b>Photos</b><span class="bar"><i style="width: 100%"></i></span><span>완료</span></span></div></div></td></tr>
+        <tr><td><input type="checkbox"></td><td><div class="file-name">DJI_20260730103548_0005_D.mp4</div></td><td>2026-07-30 10:35</td><td>4:13</td><td>1.8 GB</td><td><div class="progress-line"><span class="status-mark fail"><i>!</i>실패</span><div class="mini-steps"><span class="mini-step done"><b>인코딩</b><span class="bar"><i style="width: 100%"></i></span><span>100%</span></span><span class="mini-step fail"><b>YouTube</b><span class="bar"><i style="width: 34%"></i></span><span>실패</span></span><span class="mini-step"><b>Photos</b><span class="bar"><i style="width: 0%"></i></span><span>대기</span></span></div></div></td></tr>
+        <tr><td><input type="checkbox" disabled></td><td><div class="file-name">DJI_20260730104414_0006_D.mp4</div></td><td>2026-07-30 10:44</td><td>1:25</td><td>721.3 MB</td><td><span class="badge done">✓ 완료됨</span></td></tr>
+      </tbody>
+    </table>
+  </main>
+</body>
+</html>
