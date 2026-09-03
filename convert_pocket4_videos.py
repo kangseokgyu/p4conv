@@ -1,7 +1,10 @@
 import argparse
+import json
 import os
+import struct
 import sys
 import threading
+import uuid
 from datetime import date, datetime
 import re
 import subprocess
@@ -123,15 +126,54 @@ def probe_video_duration(path: Path) -> Optional[float]:
         return None
 
 
+def probe_file_type(path: Path) -> str:
+    """Check DJI topology metadata and QuickTime tags to distinguish Live Photo from normal videos."""
+    # 1. Check DJI header topology metadata (TPLG_..._LIVEPHOTO_...) directly from binary header
+    try:
+        with open(path, "rb") as f:
+            header = f.read(2 * 1024 * 1024)
+            if b"LIVEPHOTO" in header or b"livephoto" in header:
+                return "live_photo"
+    except Exception:
+        pass
+
+    # 2. Check ffprobe QuickTime / Apple Live Photo metadata tags
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path:
+        command = [
+            ffprobe_path,
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            str(path),
+        ]
+        try:
+            result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            data = json.loads(result.stdout)
+            tags = data.get("format", {}).get("tags", {})
+            for key in tags:
+                key_lower = key.lower()
+                if "content.identifier" in key_lower or "still-image-time" in key_lower or "live-photo" in key_lower:
+                    return "live_photo"
+        except Exception:
+            pass
+
+    return "video"
+
+
 def describe_mp4_file(path: Path) -> str:
     """Build the display string shown in the selection list."""
     mtime_str = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
     size_label = format_file_size(path.stat().st_size)
     duration_seconds = probe_video_duration(path)
+    file_type = probe_file_type(path)
+    type_badge = "📸 Live Photo" if file_type == "live_photo" else "🎬 동영상"
     if duration_seconds is None:
-        return f"{path.name} | {mtime_str} | {size_label}"
+        return f"[{type_badge}] {path.name} | {mtime_str} | {size_label}"
     duration_label = format_duration(duration_seconds)
-    return f"{path.name} | {mtime_str} | {duration_label} | {size_label}"
+    return f"[{type_badge}] {path.name} | {mtime_str} | {duration_label} | {size_label}"
 
 
 def display_mp4_files(files: List[Path]) -> None:
@@ -640,6 +682,100 @@ def convert_mp4_to_mov(
     return True
 
 
+def create_live_photo_pair(
+    source: Path,
+    ffmpeg_path: str,
+    output_dir: Optional[Path] = None,
+    on_progress: Optional[Callable[[int], None]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[Path, Path]:
+    """Extract still JPEG and transcode MOV with matching Apple Live Photo identifier metadata."""
+    target_dir = output_dir or Path.cwd()
+    jpg_path = target_dir / source.with_suffix(".jpg").name
+    mov_path = target_dir / source.with_suffix(".mov").name
+
+    def log(msg: str) -> None:
+        if log_callback:
+            log_callback(msg)
+        else:
+            print(msg)
+
+    log(f"Live Photo 대표 사진 추출: {source.name} -> {jpg_path.name}")
+    # 1. Extract middle frame (at 1.5s) as high quality JPEG
+    cmd_jpg = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-ss",
+        "00:00:01.500",
+        "-i",
+        str(source),
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        str(jpg_path),
+    ]
+    subprocess.run(cmd_jpg, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    if on_progress:
+        on_progress(30)
+
+    log(f"Live Photo 영상 변환: {source.name} -> {mov_path.name}")
+    # 2. Transcode video clip to MOV
+    scale_filter = "scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2"
+    cmd_mov = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-i",
+        str(source),
+        "-vf",
+        scale_filter,
+        "-c:v",
+        "hevc_videotoolbox",
+        "-tag:v",
+        "hvc1",
+        "-profile:v",
+        "main",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-movflags",
+        "+faststart",
+        str(mov_path),
+    ]
+    subprocess.run(cmd_mov, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    # 3. Apply Apple Live Photo pairing metadata using makelive
+    try:
+        from makelive import make_live_photo
+        asset_id = make_live_photo(str(jpg_path), str(mov_path))
+        log(f"Live Photo 메타데이터 주입 완료 (Asset ID: {asset_id})")
+    except Exception as exc:
+        log(f"Warning: makelive metadata injection failed: {exc}")
+
+    if on_progress:
+        on_progress(100)
+
+    # 4. Preserve original timestamp on both files
+    try:
+        source_stat = source.stat()
+        os.utime(jpg_path, (source_stat.st_atime, source_stat.st_mtime))
+        os.utime(mov_path, (source_stat.st_atime, source_stat.st_mtime))
+    except OSError as exc:
+        log(f"Warning: could not copy timestamps: {exc}")
+
+    return jpg_path, mov_path
+
+
 def quote_applescript_posix_path(path: Path) -> str:
     """Quote a file path so AppleScript can consume it as a POSIX file."""
     escaped = str(path).replace("\\", "\\\\").replace('"', '\\"')
@@ -759,80 +895,137 @@ def process_files(
     total_files = len(mp4_files)
     for index, source in enumerate(mp4_files, start=1):
         target_dir = output_dir or Path.cwd()
-        target = target_dir / source.with_suffix(".mov").name
-
-        file_upload_enabled = uploader is not None
-        reporter.upload_enabled = file_upload_enabled
-        reporter.start_file(index, total_files, source.name)
-
-        if target.exists():
-            reporter.skip_existing()
-            skipped += 1
-            continue
-
+        file_type = probe_file_type(source)
         caption = make_caption(source)
 
-        # Parallel: upload original MP4 to YouTube + encode to MOV
-        upload_result = {"success": False}
+        if file_type == "live_photo":
+            # Live Photo Workflow (유튜브 업로드 제외, 대표사진+영상 Live Photo 생성 및 캡션 포함 사진앱 추가)
+            target_jpg = target_dir / source.with_suffix(".jpg").name
+            target_mov = target_dir / source.with_suffix(".mov").name
 
-        def _upload_task() -> None:
-            """Background thread: upload original MP4 to YouTube."""
-            yt_title = source.name
-            yt_description = make_youtube_description(source, caption)
+            reporter.upload_enabled = False
+            reporter.start_file(index, total_files, source.name)
+
+            if target_jpg.exists() and target_mov.exists():
+                reporter.skip_existing()
+                skipped += 1
+                continue
+
             if dry_run:
-                reporter.log(f"YouTube 업로드 (dry-run): {source.name}")
-                reporter.log(f"  제목: {yt_title}")
-                reporter.log(f"  설명: {yt_description}")
-                upload_result["success"] = True
-                reporter.finish_upload(True)
-                return
-            upload_result["success"] = uploader.upload_video(
-                source, yt_title, yt_description, on_progress=reporter.update_upload,
-            )
-            reporter.finish_upload(upload_result["success"])
-
-        upload_thread = None
-        if file_upload_enabled:
-            upload_thread = threading.Thread(target=_upload_task, daemon=True)
-            upload_thread.start()
-
-        # Main thread: encode MP4 -> MOV
-        changed = convert_mp4_to_mov(
-            source,
-            ffmpeg_path,
-            dry_run=dry_run,
-            output_dir=output_dir,
-            on_progress=reporter.update_encoding,
-            log_callback=reporter.log,
-        )
-
-        # Wait for upload thread to finish
-        if upload_thread is not None:
-            upload_thread.join()
-
-        if changed:
-            converted += 1
-            reporter.finish_encoding()
-            mov_path = target
-            reporter.mark_caption(caption)
-            if import_photos:
-                if import_into_photos([mov_path], captions=[caption], dry_run=dry_run, log_callback=reporter.log):
+                reporter.log(f"Live Photo (dry-run): {source.name} -> 캡션: {caption}")
+                reporter.finish_encoding()
+                reporter.mark_caption(caption)
+                if import_photos:
+                    import_into_photos([target_jpg, target_mov], captions=[caption], dry_run=True, log_callback=reporter.log)
                     reporter.mark_photos(True)
                     imported += 1
-                    if not dry_run:
-                        try:
-                            mov_path.unlink()
-                            reporter.log(f"Deleted temporary converted file: {mov_path.name}")
-                        except OSError as exc:
-                            reporter.log(f"Warning: could not delete temporary file {mov_path.name}: {exc}")
-                    else:
-                        reporter.log(f"Dry-run: Would delete temporary file: {mov_path.name}")
-                else:
-                    reporter.mark_photos(False)
-        else:
-            skipped += 1
+                reporter.complete()
+                converted += 1
+                continue
 
-        reporter.complete()
+            try:
+                jpg_path, mov_path = create_live_photo_pair(
+                    source,
+                    ffmpeg_path,
+                    output_dir=target_dir,
+                    on_progress=reporter.update_encoding,
+                    log_callback=reporter.log,
+                )
+                converted += 1
+                reporter.finish_encoding()
+                reporter.mark_caption(caption)
+
+                if import_photos:
+                    if import_into_photos([jpg_path, mov_path], captions=[caption], dry_run=False, log_callback=reporter.log):
+                        reporter.mark_photos(True)
+                        imported += 1
+                        try:
+                            jpg_path.unlink()
+                            mov_path.unlink()
+                            reporter.log(f"Deleted temporary Live Photo files: {jpg_path.name}, {mov_path.name}")
+                        except OSError as exc:
+                            reporter.log(f"Warning: could not delete temporary files: {exc}")
+                    else:
+                        reporter.mark_photos(False)
+            except Exception as exc:
+                reporter.log(f"Failed: Live Photo {source.name} - {exc}")
+                skipped += 1
+
+            reporter.complete()
+
+        else:
+            # Normal Video Workflow (기존 기능 100% 동일 유지)
+            target = target_dir / source.with_suffix(".mov").name
+            file_upload_enabled = uploader is not None
+            reporter.upload_enabled = file_upload_enabled
+            reporter.start_file(index, total_files, source.name)
+
+            if target.exists():
+                reporter.skip_existing()
+                skipped += 1
+                continue
+
+            # Parallel: upload original MP4 to YouTube + encode to MOV
+            upload_result = {"success": False}
+
+            def _upload_task() -> None:
+                """Background thread: upload original MP4 to YouTube."""
+                yt_title = source.name
+                yt_description = make_youtube_description(source, caption)
+                if dry_run:
+                    reporter.log(f"YouTube 업로드 (dry-run): {source.name}")
+                    reporter.log(f"  제목: {yt_title}")
+                    reporter.log(f"  설명: {yt_description}")
+                    upload_result["success"] = True
+                    reporter.finish_upload(True)
+                    return
+                upload_result["success"] = uploader.upload_video(
+                    source, yt_title, yt_description, on_progress=reporter.update_upload,
+                )
+                reporter.finish_upload(upload_result["success"])
+
+            upload_thread = None
+            if file_upload_enabled:
+                upload_thread = threading.Thread(target=_upload_task, daemon=True)
+                upload_thread.start()
+
+            # Main thread: encode MP4 -> MOV
+            changed = convert_mp4_to_mov(
+                source,
+                ffmpeg_path,
+                dry_run=dry_run,
+                output_dir=output_dir,
+                on_progress=reporter.update_encoding,
+                log_callback=reporter.log,
+            )
+
+            # Wait for upload thread to finish
+            if upload_thread is not None:
+                upload_thread.join()
+
+            if changed:
+                converted += 1
+                reporter.finish_encoding()
+                mov_path = target
+                reporter.mark_caption(caption)
+                if import_photos:
+                    if import_into_photos([mov_path], captions=[caption], dry_run=dry_run, log_callback=reporter.log):
+                        reporter.mark_photos(True)
+                        imported += 1
+                        if not dry_run:
+                            try:
+                                mov_path.unlink()
+                                reporter.log(f"Deleted temporary converted file: {mov_path.name}")
+                            except OSError as exc:
+                                reporter.log(f"Warning: could not delete temporary file {mov_path.name}: {exc}")
+                        else:
+                            reporter.log(f"Dry-run: Would delete temporary file: {mov_path.name}")
+                    else:
+                        reporter.mark_photos(False)
+            else:
+                skipped += 1
+
+            reporter.complete()
 
     return converted, skipped, imported
 
