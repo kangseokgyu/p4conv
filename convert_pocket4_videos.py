@@ -906,6 +906,12 @@ def process_files(
             reporter.upload_enabled = False
             reporter.start_file(index, total_files, source.name)
 
+            if not import_photos:
+                reporter.log("Photos 임포트가 비활성화되어 Live Photo 변환을 생략합니다.")
+                reporter.complete()
+                skipped += 1
+                continue
+
             if target_jpg.exists() and target_mov.exists():
                 reporter.skip_existing()
                 skipped += 1
@@ -990,14 +996,19 @@ def process_files(
                 upload_thread.start()
 
             # Main thread: encode MP4 -> MOV
-            changed = convert_mp4_to_mov(
-                source,
-                ffmpeg_path,
-                dry_run=dry_run,
-                output_dir=output_dir,
-                on_progress=reporter.update_encoding,
-                log_callback=reporter.log,
-            )
+            if import_photos:
+                changed = convert_mp4_to_mov(
+                    source,
+                    ffmpeg_path,
+                    dry_run=dry_run,
+                    output_dir=output_dir,
+                    on_progress=reporter.update_encoding,
+                    log_callback=reporter.log,
+                )
+            else:
+                reporter.log("Photos 임포트가 비활성화되어 영상 변환(인코딩)을 생략합니다.")
+                reporter.update_encoding(100)
+                changed = False
 
             # Wait for upload thread to finish
             if upload_thread is not None:
