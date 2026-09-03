@@ -296,20 +296,19 @@ class ProgressReporter:
     def _render_unlocked(self, phase: str) -> None:
         """Render progress without acquiring the lock (caller must hold _lock)."""
         if self.enabled:
+            encode_str = "스킵됨" if self.encode_percent == -1 else f"{build_progress_bar(self.encode_percent)} {self.encode_percent:3d}%"
             if self.upload_enabled:
                 upload_bar = build_progress_bar(self.upload_percent)
-                encode_bar = build_progress_bar(self.encode_percent)
                 line = (
                     f"{self.current_label}"
                     f" | 업로드 {upload_bar} {self.upload_percent:3d}%"
-                    f" | 인코딩 {encode_bar} {self.encode_percent:3d}%"
+                    f" | 인코딩 {encode_str}"
                     f" | {phase}"
                 )
             else:
-                encode_bar = build_progress_bar(self.encode_percent)
                 line = (
                     f"{self.current_label}"
-                    f" | 인코딩 {encode_bar} {self.encode_percent:3d}%"
+                    f" | 인코딩 {encode_str}"
                     f" | {phase}"
                 )
             sys.stdout.write("\r\033[K" + line)
@@ -321,20 +320,19 @@ class ProgressReporter:
         """Redraw the progress bar after a log line (caller must hold _lock)."""
         if not self.enabled:
             return
+        encode_str = "스킵됨" if self.encode_percent == -1 else f"{build_progress_bar(self.encode_percent)} {self.encode_percent:3d}%"
         if self.upload_enabled:
             upload_bar = build_progress_bar(self.upload_percent)
-            encode_bar = build_progress_bar(self.encode_percent)
             line = (
                 f"{self.current_label}"
                 f" | 업로드 {upload_bar} {self.upload_percent:3d}%"
-                f" | 인코딩 {encode_bar} {self.encode_percent:3d}%"
+                f" | 인코딩 {encode_str}"
                 f" |"
             )
         else:
-            encode_bar = build_progress_bar(self.encode_percent)
             line = (
                 f"{self.current_label}"
-                f" | 인코딩 {encode_bar} {self.encode_percent:3d}%"
+                f" | 인코딩 {encode_str}"
                 f" |"
             )
         sys.stdout.write("\r\033[K" + line)
@@ -355,8 +353,15 @@ class ProgressReporter:
     def finish_encoding(self) -> None:
         """Mark encoding as complete."""
         with self._lock:
-            self.encode_percent = 100
+            if self.encode_percent != -1:
+                self.encode_percent = 100
             self._render_unlocked("인코딩 완료")
+
+    def skip_encoding(self) -> None:
+        """Mark encoding as skipped."""
+        with self._lock:
+            self.encode_percent = -1
+            self._render_unlocked("인코딩 스킵됨")
 
     def finish_upload(self, success: bool) -> None:
         """Mark upload as complete."""
@@ -908,6 +913,7 @@ def process_files(
 
             if not import_photos:
                 reporter.log("Photos 임포트가 비활성화되어 Live Photo 변환을 생략합니다.")
+                reporter.skip_encoding()
                 reporter.complete()
                 skipped += 1
                 continue
@@ -1007,7 +1013,7 @@ def process_files(
                 )
             else:
                 reporter.log("Photos 임포트가 비활성화되어 영상 변환(인코딩)을 생략합니다.")
-                reporter.update_encoding(100)
+                reporter.skip_encoding()
                 changed = False
 
             # Wait for upload thread to finish

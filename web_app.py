@@ -129,7 +129,13 @@ class WebProgressReporter(ProgressReporter):
         self._update(encoding=max(0, min(100, raw_percent)))
 
     def finish_encoding(self) -> None:
-        self._update(encoding=100)
+        with self.state.lock:
+            item = self.state.items.get(self.current_id)
+            if item and item.get("encoding") != "skip":
+                self._update(encoding=100)
+
+    def skip_encoding(self) -> None:
+        self._update(encoding="skip")
 
     def finish_upload(self, success: bool) -> None:
         self._update(upload=100 if success else 0, uploadFailed=not success)
@@ -141,7 +147,12 @@ class WebProgressReporter(ProgressReporter):
         self._update(photos="완료" if success else "실패")
 
     def complete(self) -> None:
-        self._update("완료", encoding=100, upload=100 if self.upload_enabled else None)
+        with self.state.lock:
+            item = self.state.items.get(self.current_id)
+            enc = 100
+            if item and item.get("encoding") == "skip":
+                enc = "skip"
+            self._update("완료", encoding=enc, upload=100 if self.upload_enabled else None)
 
     def skip_existing(self) -> None:
         self._update("이미 변환됨 - 건너뜀")
@@ -153,7 +164,7 @@ PAGE = r"""<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name
 let files=[],currentFilter='all';const $=id=>document.getElementById(id);const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(path,options){const r=await fetch(path,options);if(!r.ok)throw new Error(await r.text());return r.json()}
 const step=(label,value,state='',text=`${value}%`)=>`<span class="mini-step ${state}"><b>${label}</b><span class="bar"><i style="width:${value}%"></i></span><span>${text}</span></span>`;
-function progress(f){const p=f.progress||{};if(!Object.keys(p).length){return f.alreadyConverted?'<span class="badge done">✓ 완료됨</span>':'<span class="badge">○ 대기 중</span>'}const active=p.status==='처리 중';const isLive=f.file_type==='live_photo';const upload=isLive?'<span class="mini-step skip"><b>YouTube</b><span>건너뜀</span></span>':p.upload===null?'<span class="mini-step skip"><b>YouTube</b><span>대기</span></span>':step('YouTube',p.upload||0,p.uploadFailed?'fail':p.upload===100?'done':active?'active':'');const photos=p.photos==='완료'?step('Photos',100,'done','완료'):p.photos==='실패'?step('Photos',100,'fail','실패'):step('Photos',0,'','대기');const state=p.status==='완료'?'<span class="status-mark done"><i>✓</i>완료</span>':active?'<span class="status-mark active"><i>↻</i>처리 중</span>':'<span class="status-mark"><i>○</i>대기</span>';const encLabel=isLive?'변환':'인코딩';return `<div class="progress-line">${state}<div class="mini-steps">${step(encLabel,p.encoding||0,p.encoding===100?'done':active?'active':'')}${upload}${photos}</div></div>`}
+function progress(f){const p=f.progress||{};if(!Object.keys(p).length){return f.alreadyConverted?'<span class="badge done">✓ 완료됨</span>':'<span class="badge">○ 대기 중</span>'}const active=p.status==='처리 중';const isLive=f.file_type==='live_photo';const upload=isLive?'<span class="mini-step skip"><b>YouTube</b><span>건너뜀</span></span>':p.upload===null?'<span class="mini-step skip"><b>YouTube</b><span>대기</span></span>':step('YouTube',p.upload||0,p.uploadFailed?'fail':p.upload===100?'done':active?'active':'');const photos=p.photos==='완료'?step('Photos',100,'done','완료'):p.photos==='실패'?step('Photos',100,'fail','실패'):step('Photos',0,'','대기');const state=p.status==='완료'?'<span class="status-mark done"><i>✓</i>완료</span>':active?'<span class="status-mark active"><i>↻</i>처리 중</span>':'<span class="status-mark"><i>○</i>대기</span>';const encLabel=isLive?'변환':'인코딩';const encStep=p.encoding==='skip'?'<span class="mini-step skip"><b>'+encLabel+'</b><span>스킵됨</span></span>':step(encLabel,p.encoding||0,p.encoding===100?'done':active?'active':'');return `<div class="progress-line">${state}<div class="mini-steps">${encStep}${upload}${photos}</div></div>`}
 function setFilter(filter){currentFilter=filter;['all','video','live_photo'].forEach(f=>{$('filter-'+f).classList.toggle('active',f===filter)});renderFiles()}
 function renderFiles(){
   const videoCount=files.filter(f=>f.file_type==='video').length;
