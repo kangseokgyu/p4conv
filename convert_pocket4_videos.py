@@ -1016,10 +1016,6 @@ def process_files(
                 reporter.skip_encoding()
                 changed = False
 
-            # Wait for upload thread to finish
-            if upload_thread is not None:
-                upload_thread.join()
-
             if changed:
                 converted += 1
                 reporter.finish_encoding()
@@ -1041,6 +1037,10 @@ def process_files(
                         reporter.mark_photos(False)
             else:
                 skipped += 1
+
+            # Wait for upload thread to finish
+            if upload_thread is not None:
+                upload_thread.join()
 
             reporter.complete()
 
