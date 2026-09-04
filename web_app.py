@@ -27,7 +27,7 @@ class ConversionState:
 
     def __init__(self, args: Any) -> None:
         self.args = args
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.files: List[Path] = []
         self.running = False
         self.logs: List[str] = []
