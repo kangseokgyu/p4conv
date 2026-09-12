@@ -866,6 +866,224 @@ def import_into_photos(
     return True
 
 
+def process_video_for_photos(
+    source: Path,
+    target: Path,
+    caption: str,
+    ffmpeg_path: str,
+    dry_run: bool,
+    import_photos: bool,
+    output_dir: Optional[Path],
+    reporter: ProgressReporter,
+) -> Tuple[int, int, int]:
+    """Convert one normal video and import the converted file into Photos.
+
+    This is deliberately one workflow: the MOV is only an intermediate file
+    needed to import the original MP4 into Photos.
+    """
+    if not import_photos:
+        reporter.log("Photos 임포트가 비활성화되어 영상 변환(인코딩)을 생략합니다.")
+        reporter.skip_encoding()
+        return 0, 1, 0
+
+    if target.exists():
+        reporter.log(f"Photos 작업 건너뜀: 이미 변환된 파일이 있습니다 -> {target.name}")
+        reporter.skip_encoding()
+        return 0, 1, 0
+
+    changed = convert_mp4_to_mov(
+        source,
+        ffmpeg_path,
+        dry_run=dry_run,
+        output_dir=output_dir,
+        on_progress=reporter.update_encoding,
+        log_callback=reporter.log,
+    )
+    if not changed:
+        return 0, 1, 0
+
+    reporter.finish_encoding()
+    reporter.mark_caption(caption)
+    if not import_into_photos([target], captions=[caption], dry_run=dry_run, log_callback=reporter.log):
+        reporter.mark_photos(False)
+        return 1, 0, 0
+
+    reporter.mark_photos(True)
+    if dry_run:
+        reporter.log(f"Dry-run: Would delete temporary file: {target.name}")
+        return 1, 0, 1
+
+    try:
+        target.unlink()
+        reporter.log(f"Deleted temporary converted file: {target.name}")
+    except OSError as exc:
+        reporter.log(f"Warning: could not delete temporary file {target.name}: {exc}")
+    return 1, 0, 1
+
+
+def upload_original_to_youtube(
+    uploader: YouTubeUploader,
+    source: Path,
+    caption: str,
+    dry_run: bool,
+    reporter: ProgressReporter,
+) -> bool:
+    """Upload the original MP4 to YouTube independently of Photos work."""
+    title = source.name
+    description = make_youtube_description(source, caption)
+    if dry_run:
+        reporter.log(f"YouTube 업로드 (dry-run): {source.name}")
+        reporter.log(f"  제목: {title}")
+        reporter.log(f"  설명: {description}")
+        reporter.finish_upload(True)
+        return True
+
+    success = uploader.upload_video(source, title, description, on_progress=reporter.update_upload)
+    reporter.finish_upload(success)
+    return success
+
+
+def initialize_youtube_uploader(
+    import_youtube: bool,
+    reporter: ProgressReporter,
+) -> Optional[YouTubeUploader]:
+    """Create and authenticate the optional YouTube workflow dependency."""
+    if not import_youtube:
+        return None
+
+    script_dir = Path(__file__).resolve().parent
+    uploader = YouTubeUploader(
+        client_secrets_path=script_dir / CLIENT_SECRETS_FILE,
+        token_path=script_dir / TOKEN_FILE,
+        log_callback=reporter.log,
+    )
+    return uploader if uploader.authenticate() else None
+
+
+def process_live_photo_for_photos(
+    source: Path,
+    caption: str,
+    ffmpeg_path: str,
+    dry_run: bool,
+    import_photos: bool,
+    output_dir: Path,
+    reporter: ProgressReporter,
+) -> Tuple[int, int, int]:
+    """Create a Live Photo pair and add it to Photos; YouTube is excluded."""
+    target_jpg = output_dir / source.with_suffix(".jpg").name
+    target_mov = output_dir / source.with_suffix(".mov").name
+    if not import_photos:
+        reporter.log("Photos 임포트가 비활성화되어 Live Photo 변환을 생략합니다.")
+        reporter.skip_encoding()
+        return 0, 1, 0
+    if target_jpg.exists() and target_mov.exists():
+        reporter.log(f"Photos 작업 건너뜀: 이미 변환된 Live Photo가 있습니다 -> {source.name}")
+        reporter.skip_encoding()
+        return 0, 1, 0
+    if dry_run:
+        reporter.log(f"Live Photo (dry-run): {source.name} -> 캡션: {caption}")
+        reporter.finish_encoding()
+        reporter.mark_caption(caption)
+        import_into_photos([target_jpg, target_mov], captions=[caption], dry_run=True, log_callback=reporter.log)
+        reporter.mark_photos(True)
+        return 1, 0, 1
+
+    try:
+        jpg_path, mov_path = create_live_photo_pair(
+            source,
+            ffmpeg_path,
+            output_dir=output_dir,
+            on_progress=reporter.update_encoding,
+            log_callback=reporter.log,
+        )
+        reporter.finish_encoding()
+        reporter.mark_caption(caption)
+        if not import_into_photos([jpg_path, mov_path], captions=[caption], log_callback=reporter.log):
+            reporter.mark_photos(False)
+            return 1, 0, 0
+        reporter.mark_photos(True)
+        try:
+            jpg_path.unlink()
+            mov_path.unlink()
+            reporter.log(f"Deleted temporary Live Photo files: {jpg_path.name}, {mov_path.name}")
+        except OSError as exc:
+            reporter.log(f"Warning: could not delete temporary files: {exc}")
+        return 1, 0, 1
+    except Exception as exc:
+        reporter.log(f"Failed: Live Photo {source.name} - {exc}")
+        return 0, 1, 0
+
+
+def process_normal_video(
+    source: Path,
+    caption: str,
+    ffmpeg_path: str,
+    dry_run: bool,
+    import_photos: bool,
+    output_dir: Path,
+    uploader: Optional[YouTubeUploader],
+    reporter: ProgressReporter,
+) -> Tuple[int, int, int]:
+    """Run the independent Photos and YouTube workflows for one normal video."""
+    target = output_dir / source.with_suffix(".mov").name
+    photos_result = {"converted": 0, "skipped": 0, "imported": 0}
+
+    def photos_task() -> None:
+        try:
+            converted, skipped, imported = process_video_for_photos(
+                source, target, caption, ffmpeg_path, dry_run, import_photos, output_dir, reporter
+            )
+            photos_result.update(converted=converted, skipped=skipped, imported=imported)
+        except Exception as exc:
+            reporter.log(f"Failed: Photos 작업 {source.name} - {exc}")
+            photos_result["skipped"] = 1
+
+    photos_thread = threading.Thread(target=photos_task, daemon=True)
+    photos_thread.start()
+    upload_thread = None
+    if uploader is not None:
+        upload_thread = threading.Thread(
+            target=upload_original_to_youtube,
+            args=(uploader, source, caption, dry_run, reporter),
+            daemon=True,
+        )
+        upload_thread.start()
+
+    photos_thread.join()
+    if upload_thread is not None:
+        upload_thread.join()
+    return photos_result["converted"], photos_result["skipped"], photos_result["imported"]
+
+
+def process_single_file(
+    source: Path,
+    index: int,
+    total_files: int,
+    ffmpeg_path: str,
+    dry_run: bool,
+    import_photos: bool,
+    output_dir: Path,
+    uploader: Optional[YouTubeUploader],
+    reporter: ProgressReporter,
+) -> Tuple[int, int, int]:
+    """Set up progress reporting and process one selected source file."""
+    caption = make_caption(source)
+    is_live_photo = probe_file_type(source) == "live_photo"
+    reporter.upload_enabled = not is_live_photo and uploader is not None
+    reporter.start_file(index, total_files, source.name)
+
+    if is_live_photo:
+        result = process_live_photo_for_photos(
+            source, caption, ffmpeg_path, dry_run, import_photos, output_dir, reporter
+        )
+    else:
+        result = process_normal_video(
+            source, caption, ffmpeg_path, dry_run, import_photos, output_dir, uploader, reporter
+        )
+    reporter.complete()
+    return result
+
+
 def process_files(
     mp4_files: List[Path],
     ffmpeg_path: str,
@@ -875,175 +1093,23 @@ def process_files(
     output_dir: Optional[Path] = None,
     reporter: Optional["ProgressReporter"] = None,
 ) -> Tuple[int, int, int]:
-    """Convert and import a selected batch of files one by one."""
-    converted = 0
-    skipped = 0
-    imported = 0
+    """Process selected files sequentially and return Photos workflow totals."""
     if not mp4_files:
         return 0, 0, 0
 
     reporter = reporter or ProgressReporter(enabled=sys.stdout.isatty() and not dry_run)
     reporter.log(f"Processing {len(mp4_files)} selected mp4 file(s)")
-
-    # YouTube service initialization
-    uploader = None
-    if import_youtube:
-        script_dir = Path(__file__).resolve().parent
-        uploader = YouTubeUploader(
-            client_secrets_path=script_dir / CLIENT_SECRETS_FILE,
-            token_path=script_dir / TOKEN_FILE,
-            log_callback=reporter.log,
-        )
-        if not uploader.authenticate():
-            uploader = None
-
+    uploader = initialize_youtube_uploader(import_youtube, reporter)
+    target_dir = output_dir or Path.cwd()
+    converted = skipped = imported = 0
     total_files = len(mp4_files)
     for index, source in enumerate(mp4_files, start=1):
-        target_dir = output_dir or Path.cwd()
-        file_type = probe_file_type(source)
-        caption = make_caption(source)
-
-        if file_type == "live_photo":
-            # Live Photo Workflow (유튜브 업로드 제외, 대표사진+영상 Live Photo 생성 및 캡션 포함 사진앱 추가)
-            target_jpg = target_dir / source.with_suffix(".jpg").name
-            target_mov = target_dir / source.with_suffix(".mov").name
-
-            reporter.upload_enabled = False
-            reporter.start_file(index, total_files, source.name)
-
-            if not import_photos:
-                reporter.log("Photos 임포트가 비활성화되어 Live Photo 변환을 생략합니다.")
-                reporter.skip_encoding()
-                reporter.complete()
-                skipped += 1
-                continue
-
-            if target_jpg.exists() and target_mov.exists():
-                reporter.skip_existing()
-                skipped += 1
-                continue
-
-            if dry_run:
-                reporter.log(f"Live Photo (dry-run): {source.name} -> 캡션: {caption}")
-                reporter.finish_encoding()
-                reporter.mark_caption(caption)
-                if import_photos:
-                    import_into_photos([target_jpg, target_mov], captions=[caption], dry_run=True, log_callback=reporter.log)
-                    reporter.mark_photos(True)
-                    imported += 1
-                reporter.complete()
-                converted += 1
-                continue
-
-            try:
-                jpg_path, mov_path = create_live_photo_pair(
-                    source,
-                    ffmpeg_path,
-                    output_dir=target_dir,
-                    on_progress=reporter.update_encoding,
-                    log_callback=reporter.log,
-                )
-                converted += 1
-                reporter.finish_encoding()
-                reporter.mark_caption(caption)
-
-                if import_photos:
-                    if import_into_photos([jpg_path, mov_path], captions=[caption], dry_run=False, log_callback=reporter.log):
-                        reporter.mark_photos(True)
-                        imported += 1
-                        try:
-                            jpg_path.unlink()
-                            mov_path.unlink()
-                            reporter.log(f"Deleted temporary Live Photo files: {jpg_path.name}, {mov_path.name}")
-                        except OSError as exc:
-                            reporter.log(f"Warning: could not delete temporary files: {exc}")
-                    else:
-                        reporter.mark_photos(False)
-            except Exception as exc:
-                reporter.log(f"Failed: Live Photo {source.name} - {exc}")
-                skipped += 1
-
-            reporter.complete()
-
-        else:
-            # Normal Video Workflow (기존 기능 100% 동일 유지)
-            target = target_dir / source.with_suffix(".mov").name
-            file_upload_enabled = uploader is not None
-            reporter.upload_enabled = file_upload_enabled
-            reporter.start_file(index, total_files, source.name)
-
-            if target.exists():
-                reporter.skip_existing()
-                skipped += 1
-                continue
-
-            # Parallel: upload original MP4 to YouTube + encode to MOV
-            upload_result = {"success": False}
-
-            def _upload_task() -> None:
-                """Background thread: upload original MP4 to YouTube."""
-                yt_title = source.name
-                yt_description = make_youtube_description(source, caption)
-                if dry_run:
-                    reporter.log(f"YouTube 업로드 (dry-run): {source.name}")
-                    reporter.log(f"  제목: {yt_title}")
-                    reporter.log(f"  설명: {yt_description}")
-                    upload_result["success"] = True
-                    reporter.finish_upload(True)
-                    return
-                upload_result["success"] = uploader.upload_video(
-                    source, yt_title, yt_description, on_progress=reporter.update_upload,
-                )
-                reporter.finish_upload(upload_result["success"])
-
-            upload_thread = None
-            if file_upload_enabled:
-                upload_thread = threading.Thread(target=_upload_task, daemon=True)
-                upload_thread.start()
-
-            # Main thread: encode MP4 -> MOV
-            if import_photos:
-                changed = convert_mp4_to_mov(
-                    source,
-                    ffmpeg_path,
-                    dry_run=dry_run,
-                    output_dir=output_dir,
-                    on_progress=reporter.update_encoding,
-                    log_callback=reporter.log,
-                )
-            else:
-                reporter.log("Photos 임포트가 비활성화되어 영상 변환(인코딩)을 생략합니다.")
-                reporter.skip_encoding()
-                changed = False
-
-            if changed:
-                converted += 1
-                reporter.finish_encoding()
-                mov_path = target
-                reporter.mark_caption(caption)
-                if import_photos:
-                    if import_into_photos([mov_path], captions=[caption], dry_run=dry_run, log_callback=reporter.log):
-                        reporter.mark_photos(True)
-                        imported += 1
-                        if not dry_run:
-                            try:
-                                mov_path.unlink()
-                                reporter.log(f"Deleted temporary converted file: {mov_path.name}")
-                            except OSError as exc:
-                                reporter.log(f"Warning: could not delete temporary file {mov_path.name}: {exc}")
-                        else:
-                            reporter.log(f"Dry-run: Would delete temporary file: {mov_path.name}")
-                    else:
-                        reporter.mark_photos(False)
-            else:
-                skipped += 1
-
-            # Wait for upload thread to finish
-            if upload_thread is not None:
-                upload_thread.join()
-
-            reporter.complete()
-
+        converted_count, skipped_count, imported_count = process_single_file(
+            source, index, total_files, ffmpeg_path, dry_run, import_photos, target_dir, uploader, reporter
+        )
+        converted += converted_count
+        skipped += skipped_count
+        imported += imported_count
     return converted, skipped, imported
 
 
